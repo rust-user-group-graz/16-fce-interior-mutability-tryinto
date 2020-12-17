@@ -1,0 +1,416 @@
+\documentclass{beamer}
+\usetheme{metropolis}
+%\setsansfont[BoldFont={Fira Sans SemiBold}]{Fira Sans Book}
+%\setsansfont{Fontin}
+%\setsansfont{Gillius ADF No2}
+%\setsansfont{Phetsarath OT}
+\setsansfont{Source Sans Pro}
+\setmonofont{Source Code Pro}
+
+\hypersetup{colorlinks=true,
+            linkcolor=mRustLightOrange,
+            menucolor=mRustLightOrange,
+            pagecolor=mRustLightOrange,
+            urlcolor=mRustLightOrange}
+\usepackage{csquotes}
+\usepackage{comment}
+\usepackage{xcolor}
+\usepackage{minted}
+
+\newfontfamily\codefont{Source Code Pro}
+\newcommand\code[1]{\,{\color[HTML]{884400}#1}\,}
+\newcommand\source[1]{$\rightarrow$ via #1}
+
+\title{Fluence Compute Engine (FCE), interior mutability, and TryInto}
+\date{\today}
+\author{Lukas Prokop}
+\institute{RustGraz community\vfill\hfill\includegraphics[height=2cm]{images/rustacean-orig-noshadow.png}}
+\begin{document}
+\maketitle
+
+%\section{Prologue}
+
+\section{Fluence Compute Engine}
+
+\begin{frame}[fragile]{FCE}
+  What is FCE?\vspace{8pt}
+
+  \begin{quote}
+    \href{https://github.com/fluencelabs/fce}{Fluence Compute Engine (FCE)} is a general purpose Wasm runtime that could be used in different scenarios, especially in programs based on the ECS pattern or plugin architecture. It runs multi-module WebAssembly applications with interface-types and shared-nothing linking scheme.
+  \end{quote}
+
+  Presentation by \href{https://github.com/michaelvoronov}{michaelvoronov}:\vspace{8pt}
+  \begin{quote}
+    Mike Voronov has more than 10 years of experience in C++ and 2+ years experience in Rust and WebAssembly
+  \end{quote}
+\end{frame}
+
+\section{Interior mutability}
+
+\begin{frame}[fragile]{Reference semantics}
+  \textbf{Revision:} shared versus mutable references.
+
+  \begin{minted}{rust}
+fn overwrite(base: &u32, new_value: &u32) {
+  base = new_value;
+}
+fn main() {
+  let value = 3;
+  overwrite(&value, &42);
+  println!("{}", value);
+}
+  \end{minted}
+  \textbf{Does it compile?} \pause No, \emph{lifetime mismatch}.
+\end{frame}
+
+\begin{frame}[fragile]{Reference semantics}
+  \begin{minted}{rust}
+fn overwrite<'a>(base: &'a u32,
+                 new_value: &'a u32) {
+  base = new_value;
+}
+fn main() {
+  let value = 3;
+  overwrite(&value, &42);
+  println!("{}", value);
+}
+  \end{minted}
+  \textbf{Does it compile?} \pause No, \emph{cannot assign to immutable argument 'base'
+}.
+\end{frame}
+
+\begin{frame}[fragile]{Reference semantics}
+  \begin{minted}{rust}
+fn overwrite<'a>(mut base: &'a u32,
+                 new_value: &'a u32) {
+  base = new_value;
+}
+fn main() {
+  let value = 3;
+  overwrite(&value, &42);
+  println!("{}", value);
+}
+  \end{minted}
+  \textbf{Does it compile?} \pause Yes, but prints \texttt{3}, not \texttt{42}.
+\end{frame}
+
+\begin{frame}[fragile]{Reference semantics}
+  Modifying the reference \dots
+  \begin{minted}{rust}
+fn overwrite<'a>(mut base: &'a u32,
+                 new_value: &'a u32);
+  \end{minted}
+  versus
+  \begin{minted}{rust}
+fn overwrite<'a>(base: &'a mut u32,
+                 new_value: &'a u32);
+  \end{minted}
+  \dots{} modifying the value behind a reference.
+\end{frame}
+
+\begin{frame}[fragile]{Reference semantics}
+  \begin{minted}{rust}
+fn overwrite<'a>(base: &'a mut u32,
+                 new_value: &'a u32) {
+  *base = *new_value;
+}
+fn main() {
+  let mut value = 3;
+  overwrite(&mut value, &mut 42);
+  println!("{}", value); // prints 42
+}
+  \end{minted}
+\end{frame}
+
+\begin{frame}[fragile]{Excursion: constant variables}
+  \textbf{Small excursion:}
+  Benedikt also pointed out the following snippet:
+  \begin{minted}{rust}
+fn overwrite<'a>(base: &'a mut u32,
+                 new_value: &'a u32) {
+  *base = *new_value;
+}
+fn main() {
+  let mut value = 3;
+  overwrite(&mut 42, &mut 42);
+  println!("{}", value); // prints 3
+}
+  \end{minted}
+  Apparently, rust creates \emph{two} local variables with value \emph{42}.
+  This is interesting since constants of same value need not be allocated twice usually.
+\end{frame}
+
+\begin{frame}[fragile]{Mutability semantics}
+  \begin{enumerate}
+    \item A variable is mutable; or not.
+    \item A reference is mutable; or not.
+    \item If a struct instance bound to a variable is mutable; its members are mutable too (\emph{inherited mutability}).
+    \item Mutability checks happen at \emph{compile time}.
+  \end{enumerate}
+\begin{minted}[fontsize=\small]{rust}
+struct User {
+  id: u32,
+  posts_count: u32,
+}
+let mut meisterluk = User {
+  id: 1,
+  posts_count: 42
+};
+\end{minted}
+\end{frame}
+
+\begin{frame}[standout]
+  What about a data structure that modifying elements in the background without knowledge of the user?
+\end{frame}
+
+\begin{frame}[fragile]{Interior mutability types in rust}
+  Multithreaded? Use atomic datatypes or locks (Mutex, RwLock, \dots)!
+  Otherwise, \dots
+
+  \begin{description}
+    \item[\mintinline{rust}{Cell<T>}] Provides interior mutability for some value.
+    \item[\mintinline{rust}{RefCell<T>}] Provides interior mutability for some value and returns references in its API.
+    \item[\mintinline{rust}{UnsafeCell<T>}] Underlying primitive for the types above
+  \end{description}
+  \dots{} implemented with \emph{runtime} checks!
+\end{frame}
+
+\begin{frame}[fragile]{Cell}
+  \mintinline{rust}{Cell<T>:} This type wraps an existing value and provides interior mutability.
+
+  \begin{minted}[fontsize=\scriptsize]{rust}
+use std::cell::Cell;
+struct User {
+  id: u32,
+  count_posts: Cell<u32>,
+}
+
+fn main() {
+  let meisterluk = User {
+    id: 1,
+    count_posts: Cell::new(42),
+  };
+  // meisterluk.id = 4;  // error: meisterluk is not mutable
+  meisterluk.count_posts.replace(55);
+  println!("User=({}, {})",
+    meisterluk.id,
+    meisterluk.count_posts.get()
+  );
+}
+  \end{minted}
+\end{frame}
+
+\begin{frame}[fragile]{Cell API}
+  \mintinline{rust}{Cell<T>:} This type wraps an existing value and provides interior mutability.
+
+  \begin{enumerate}
+    \item \mintinline{rust}{pub const fn new(value: T) -> Cell<T>}
+    \item \mintinline{rust}{pub fn set(&self, val: T)}
+    \item \mintinline{rust}{pub fn swap(&self, other: &Cell<T>)}
+    \item \mintinline{rust}{pub fn replace(&self, val: T) -> T}
+    \item \mintinline{rust}{pub fn into_inner(self) -> T}
+    \item \mintinline{rust}{pub const fn new(value: T) -> Cell<T>}
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}[fragile]{RefCell}
+  \mintinline{rust}{RefCell<T>:} This type wraps an existing value and provides references for interior mutability.
+
+  \begin{minted}[fontsize=\scriptsize]{rust}
+use std::cell::RefCell;
+
+struct User {
+  id: u32,
+  count_posts: RefCell<u32>,
+}
+
+fn main() {
+  let meisterluk = User {
+    id: 1,
+    count_posts: RefCell::new(42),
+  };
+  meisterluk.count_posts.replace(55);
+  println!("User=({}, {})",
+           meisterluk.id,
+           meisterluk.count_posts.borrow());
+}
+\end{minted}
+\end{frame}
+
+\begin{frame}[fragile]{RefCell API}
+  \begin{enumerate}
+    \item \mintinline{rust}{pub const fn new(value: T) -> RefCell<T>}
+    \item \mintinline{rust}{pub fn borrow(&self) -> Ref<'_, T>}
+    \item \mintinline{rust}{pub fn try_borrow(&self)} \\
+          \mintinline{rust}{-> Result<Ref<'_, T>, BorrowError>}
+    \item \mintinline{rust}{pub fn borrow_mut(&self) -> RefMut<'_, T>}
+    \item \mintinline{rust}{pub fn try_borrow_mut(&self)} \\
+          \mintinline{rust}{-> Result<RefMut<'_, T>, BorrowMutError>}
+    \item \mintinline{rust}{pub fn as_ptr(&self) -> *mut T}
+    \item \mintinline{rust}{pub fn get_mut(&mut self) -> &mut T}
+    \item \mintinline{rust}{pub unsafe fn try_borrow_unguarded(&self)} \\
+          \mintinline{rust}{-> Result<&T, BorrowError>}
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}[fragile]{RefCell}
+  \begin{minted}[fontsize=\scriptsize]{rust}
+use std::cell::RefCell;
+
+struct User {
+  id: u32,
+  count_posts: RefCell<u32>,
+}
+
+fn main() {
+  let meisterluk = User {
+    id: 1,
+    count_posts: RefCell::new(42),
+  };
+  let a = meisterluk.count_posts.borrow_mut();
+  let _ = meisterluk.count_posts.borrow_mut();
+}
+  \end{minted}
+
+  Runtime error!
+  \begin{minted}[fontsize=\scriptsize]{text}
+thread 'main' panicked at 'already borrowed: BorrowMutError',
+      src/main.rs:14:36
+note: run with `RUST_BACKTRACE=1` environment variable
+      to display a backtrace    
+  \end{minted}
+\end{frame}
+
+\section{TryInto / Into / TryFrom / From}
+
+\begin{frame}[fragile]{Motivation}
+  \begin{enumerate}
+    \item Sometimes it is convenient to convert one type into another (\emph{coercion}, \emph{casting})
+    \item Usually done explicitly in rust with \mintinline{rust}{as} keyword
+    \item But when calling a function, we often know the source and target target. How can we convert it?
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}[fragile]{4 traits}
+  \begin{minted}[fontsize=\small]{rust}
+pub trait Into<T>: Sized {
+  fn into(self) -> T;
+}
+pub trait TryInto<T>: Sized {
+  type Error;
+  fn try_into(self)
+    -> Result<T, Self::Error>;
+}
+pub trait From<T>: Sized {
+  fn from(_: T) -> Self;
+}
+pub trait TryFrom<T>: Sized {
+  type Error;
+  fn try_from(value: T)
+    -> Result<Self, Self::Error>;
+}
+  \end{minted}
+\end{frame}
+
+\begin{frame}[fragile]{4 traits}
+  \begin{enumerate}
+    \item Try traits permit conversion to fail.
+    \item All traits are reflexive (T can be converted \emph{into} T).
+    \item Prefer to implement \mintinline{rust}{TryFrom} instead of \mintinline{rust}{TryInto}
+    \item Implementing \mintinline{rust}{From} automatically provides one with an implementation of \mintinline{rust}{Into}.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}[fragile]{Example implementation}
+  Example via \href{https://doc.rust-lang.org/stable/rust-by-example/conversion/try_from_try_into.html}{Rust by Example}:
+  \begin{minted}[fontsize=\small]{rust}
+use std::convert::{TryFrom, TryInto};
+
+#[derive(Debug, PartialEq)]
+struct EvenNumber(i32);
+
+impl TryFrom<i32> for EvenNumber {
+  type Error = ();
+  fn try_from(value: i32)
+    -> Result<Self, Self::Error>
+  {
+    if value % 2 == 0 {
+        Ok(EvenNumber(value))
+    } else {
+        Err(())
+} } }
+\end{minted}
+\end{frame}
+
+\begin{frame}[fragile]{Example implementation}
+  \begin{minted}[fontsize=\small]{rust}
+fn main() {
+  // TryFrom
+  assert_eq!(EvenNumber::try_from(8),
+             Ok(EvenNumber(8)));
+  assert_eq!(EvenNumber::try_from(5),
+             Err(()));
+
+  // TryInto
+  let result: Result<EvenNumber, ()> = 8i32.try_into();
+  assert_eq!(result, Ok(EvenNumber(8)));
+  let result: Result<EvenNumber, ()> = 5i32.try_into();
+  assert_eq!(result, Err(()));
+}
+  \end{minted}
+\end{frame}
+
+\begin{frame}[fragile]{Strings to vectors}
+  Strings can be converted into a vector of bytes.
+
+  \begin{minted}{rust}
+fn main() {
+    let a: Vec<u8> = String::from("hello").into();
+    println!("{}", a[0]);
+}
+  \end{minted}
+\end{frame}
+
+\begin{frame}[fragile]{Into as trait bound}
+  Trait bounds can specify that any type convertible into another will be accepted.
+  \begin{minted}[fontsize=\small]{rust}
+fn is_hello<T: Into<Vec<u8>>>(s: T) {
+  let bytes = b"hello".to_vec();
+  assert_eq!(bytes, s.into());
+}
+
+let s = "hello".to_string();
+is_hello(s);
+  \end{minted}
+\end{frame}
+
+\section{Epilogue}
+
+\begin{frame}[fragile]{Quiz}
+  \begin{description}
+    \item[Who maintains the WASM standard?] \hfill{} \\
+      ~\uncover<2->{WebAssembly became a World Wide Web Consortium recommendation in Dec 2019}
+    \item[What is mutable about a mutable reference?] \hfill{} \\
+      ~\uncover<3->{The value the reference is pointing to}
+    \item[How can you implement casting for your own type?] \hfill{} \\
+      ~\uncover<4->{Implement Into/TryInto or From/TryFrom}
+    \item[When do you implement Into instead of TryInto?] \hfill{} \\
+      ~\uncover<5->{If the conversion cannot fail under any circumstances.}
+  \end{description}
+\end{frame}
+
+\begin{frame}[fragile]{Next time}
+  \begin{tabular}{ll}
+    \textbf{Next meetup}   & Wed, 2021/01/27 \\
+    \textbf{Topic}         & Cross-compilation: \\
+                           & compiling for the raspberry PI
+  \end{tabular}
+\end{frame}
+
+\begin{frame}[standout]
+  Thank you!
+
+  \includegraphics[width=40pt]{images/rustacean-flat-happy.png}
+\end{frame}
+
+\end{document}
